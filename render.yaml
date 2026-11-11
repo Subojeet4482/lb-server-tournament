@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: ff-load-balancer
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: S1_URL
+        sync: false
+      - key: S2_URL
+        sync: false
+      - key: S3_URL
+        sync: false
+      - key: S4_URL
+        sync: false
+      - key: S5_URL
+        sync: false
+      - key: INTERNAL_KEY
+        sync: false
+      - key: LB_ADMIN_KEY
+        sync: false
+      - key: DOMAIN_CHECK
+        sync: false
+      - key: BOOTSTRAP_DOMAINS
+        sync: false
+      - key: ALLOW_LOCALHOST
+        sync: false
+      - key: TRUSTED_PROXIES
+        sync: false
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_ADMIN_IDS
+        sync: false
+      - key: TG_MODE
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: TG_WEBHOOK_SECRET
+        sync: false
+      - key: KEEPALIVE
+        sync: false
+      - key: KEEPALIVE_INTERVAL
+        sync: false
+      - key: HEALTH_INTERVAL
+        sync: false
+      - key: FAIL_THRESHOLD
+        sync: false
+      - key: HEALTH_TIMEOUT
+        sync: false
+      - key: CONNECT_TIMEOUT
+        sync: false
+      - key: REQUEST_TIMEOUT
+        sync: false
+      - key: RATE_LIMIT_PER_MIN
+        sync: false
+      - key: MAX_BODY_BYTES
+        sync: false
+      - key: STATE_STORE_URL
+        sync: false
+      - key: THREADS
+        sync: false
