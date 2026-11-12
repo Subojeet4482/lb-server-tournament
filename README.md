@@ -12,14 +12,40 @@ User panel -> **sirf is URL ko** request karta hai. Ye request ko sahi server pe
 > Limit: koi script (curl) copy kiya hua Origin + key bhej sakta hai. Isliye asli suraksha = 1 ghante ka login token + rate limit + Server-5 fraud check + server-side validation. Domain check bas browsers / dusre sites ko rokta hai.
 
 ## Telegram bot (inline buttons)
-`/start` dabao: **State payment block** (state list, switches, message, user check), **Servers** (Auto / Force ON / OFF / Maintenance, health, traffic route), **Domains** (add, new site key, disable, remove), **Fraud cases** (unban / confirm), **Blocked requests** (jo domain reject hue, ek tap me allow), **Backup**, **Stats**, **Settings** (domain check on/off).
+`/start` dabao. Menu:
+* **📥 Domain requests** — jo websites tumhari API use karne aayi par approved nahi thi (top list, 10 per page: 🆕 newest / 🔥 most active / 📋 log).
+  Har ek ko **✅ Approve** (site key milti hai) / **✅ Origin only** / **❌ Reject** (hamesha ke liye silent block, dobara list me nahi aata) / **❌ Reject + ban IP** / 🚷 Ban IP. "Reject all" bhi hai. Rejected list se wapas allow kar sakte ho.
+  Naya domain aate hi **alert** milta hai (Approve/Reject buttons ke saath; max 12/ghanta, spam se bachne ke liye).
+* **🌐 Domains** — enable/disable, ♻️ new key, 🔓 key off (origin only), **expiry** (24h / 7d / 30d / never), **per-domain rate limit**, note, remove, request count.
+* **🖥 Servers** — Auto / Force ON / OFF, maintenance, health, traffic route, "All → AUTO".
+* **🛡 Fraud cases**, **🗺 State block**, **📊 Stats** (top domains, blocked / rejected / banned counters).
+* **🚷 Banned IPs** — ban (permanent ya N ghante), unban. `/banip 1.2.3.4 24`.
+* **📜 Activity log** — kisne kab kya badla (bot + web dono ka).
+* **👥 Admins** — `TG_ADMIN_IDS` = owners; owner bot se extra admin add/remove kar sakta hai (`/addadmin <id>`).
+* **💾 Backup** — DB backup chalao aur file **seedha Telegram me** lo (Render disk restart pe saaf hota hai), purane backups ki list se file lo,
+  **config export** (domains + key hashes + rejected + bans + settings ek .json) aur **config restore** (file bhejo -> Replace ya Merge). **Auto backup** har 6/12/24/72/168 ghante (Settings).
+* **⚙️ Settings** — domain check, alerts, rate limit, **maintenance mode** (+ message), auto backup, **bot mode (webhook <-> polling) runtime me switch**, bot status.
+Commands: `/help` me poori list.
 Setup: @BotFather se token, @userinfobot se apni ID -> `TG_BOT_TOKEN`, `TG_ADMIN_IDS`. Pehla domain: bot me `/adddomain app.example.com`.
+
+## Web control panel
+`https://<tumhara-lb>/lb/ui` — login = `LB_ADMIN_KEY` (key sirf browser tab me rehti hai). Bot ke saare kaam: requests approve/reject, domains, servers, IP bans, backup/restore (config download/upload, DB backup download), activity log, settings.
+10 galat key -> us IP par 10 min lock. Page strict CSP ke saath, data kabhi HTML ki tarah insert nahi hota.
+JSON API: `/lb/admin/*` (header `X-Admin-Key`).
+
+## Notes
+* State (domains, rejected, bans, admins, settings, log) Server-4 (`STATE_STORE_URL`) me save hoti hai. Agar LB restart ke time Server-4 so raha ho, to jab tak wo padhi nahi jati tab tak LB usse **overwrite nahi karta** — baad me merge karke save karta hai.
+* Per-domain request counters restart par 0 nahi hote jab tak state save ho (save har change par hota hai); global Stats restart par reset hoti hain.
+* `BOOTSTRAP_DOMAINS` wale domain restart par wapas add ho jate hain — unhe hamesha ke liye hatana ho to env se bhi hatao.
+* Tests: `pip install pytest && python -m pytest tests -q`.
 
 ### Bot mode (`TG_MODE`)
 | | `webhook` (free Render) | `polling` (paid / VPS) |
 |---|---|---|
 | Kaise | Telegram message `PUBLIC_URL/tg/webhook/<secret>` par bhejta hai | Bot Telegram se `getUpdates` mangta hai |
 | Free hours | LB soya ho to message se jaag jata hai (pehla button 30-60 sec) | LB hamesha jaga rehta hai (keep-alive ON) |
+
+Mode **bot ke andar se bhi** badal sakte ho: Settings -> Bot mode (restart nahi chahiye, env `TG_MODE` default rehta hai).
 | Env | `PUBLIC_URL` (https). Secret apne-aap (ya `TG_WEBHOOK_SECRET`) | kuch extra nahi |
 * Webhook mode: har start par webhook **apne-aap register** hota hai, har 30 min check hota hai (kisi ne badla to wapas set), header me secret token verify hota hai, same `update_id` dobara process nahi hota.
 * Dono mode kabhi ek saath active nahi: webhook me `getUpdates` nahi chalta; polling me pehle `deleteWebhook` hota hai aur `/tg/webhook` 404 deta hai.
