@@ -36,7 +36,13 @@ CONNECT_TIMEOUT = float(env("CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(env("REQUEST_TIMEOUT", "60"))
 RATE_PER_MIN = int(env("RATE_LIMIT_PER_MIN", "300"))
 STATE_FILE = env("STATE_FILE", "/tmp/lb_state.json")
-STATE_STORE_URL = env("STATE_STORE_URL", URLS["s4"]).rstrip("/")
+STATE_STORE_ENV = env("STATE_STORE_URL").rstrip("/")
+URL_BOT = {i: False for i in IDS}      # True = this server's URL was set from Telegram / admin panel (saved in the state store), not from Render env
+
+
+def state_store():
+    """Where the saved state lives: STATE_STORE_URL if set, else Server-4's URL (env or set from Telegram)."""
+    return STATE_STORE_ENV or URLS["s4"]
 
 ROUTES = [("/auth", "s1"), ("/user", "s1"), ("/wallet", "s1"), ("/matches", "s1"), ("/leaderboard", "s1"), ("/public", "s1"),
           ("/ref", "s1"), ("/geo", "s1"), ("/history", "s2"), ("/chat", "s3"), ("/game", "s3"), ("/fraud", "s5"), ("/backup", "s4")]
@@ -110,7 +116,7 @@ def _sha(x):
 
 
 def _snapshot():
-    return {"servers": {i: {"mode": S[i]["mode"]} for i in IDS}, "domains": DOMAINS, "settings": SETTINGS, "events": list(EVENTS)[:80]}
+    return {"servers": {i: {"mode": S[i]["mode"]} for i in IDS}, "domains": DOMAINS, "settings": SETTINGS, "events": list(EVENTS)[:80], "urls": {i: URLS[i] for i in IDS if URL_BOT[i] and URLS[i]}}
 
 
 def _save():
@@ -120,9 +126,9 @@ def _save():
             json.dump(st, f)
     except Exception:
         pass
-    if STATE_STORE_URL and INTERNAL_KEY:
+    if state_store() and INTERNAL_KEY:
         try:
-            requests.put(STATE_STORE_URL + "/internal/sys/lbstate", json={"state": st}, headers={"X-Internal-Key": INTERNAL_KEY}, timeout=8)
+            requests.put(state_store() + "/internal/sys/lbstate", json={"state": st}, headers={"X-Internal-Key": INTERNAL_KEY}, timeout=8)
         except Exception:
             pass
 
@@ -154,6 +160,11 @@ def _apply(st):
             SETTINGS["featureMsg"] = {k: str(v)[:300] for k, v in se["featureMsg"].items() if k in FEATURES}
         if isinstance(se.get("ipBlock"), list):
             SETTINGS["ipBlock"] = [str(x)[:64] for x in se["ipBlock"]][:500]
+    if isinstance(st.get("urls"), dict):                       # server URLs added from Telegram / admin panel
+        for i, u in st["urls"].items():
+            u = clean_url(u)
+            if i in URLS and u:
+                URLS[i], URL_BOT[i] = u, True
     if isinstance(st.get("events"), list) and not EVENTS:
         for e in reversed(st["events"][:80]):
             if isinstance(e, dict) and e.get("text"):
@@ -163,9 +174,9 @@ def _apply(st):
 
 def _load():
     st = None
-    if STATE_STORE_URL and INTERNAL_KEY:
+    if state_store() and INTERNAL_KEY:
         try:
-            r = requests.get(STATE_STORE_URL + "/internal/sys/lbstate", headers={"X-Internal-Key": INTERNAL_KEY}, timeout=8)
+            r = requests.get(state_store() + "/internal/sys/lbstate", headers={"X-Internal-Key": INTERNAL_KEY}, timeout=8)
             if r.status_code == 200:
                 inner = r.json().get("state") or {}
                 st = inner.get("state") if isinstance(inner.get("state"), dict) else inner
@@ -389,6 +400,124 @@ def _admin_ok():
     return bool(ADMIN_KEY) and len(k) == len(ADMIN_KEY) and __import__("hmac").compare_digest(k, ADMIN_KEY)
 
 
+# ------------------------------------------------------------------ server URLs (add / change from Telegram or the admin panel)
+def clean_url(u):
+    """'my-s1.onrender.com' / 'https://my-s1.onrender.com/' -> 'https://my-s1.onrender.com'.  '' when it is not a usable address."""
+    u = str(u or "").strip().strip("<>\"' ").rstrip("/")
+    if not u or " " in u:
+        return ""
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    pr = urlparse(u)
+    host = (pr.hostname or "").lower()
+    if not host or "." not in host and host != "localhost":
+        return ""
+    if pr.scheme.lower() == "http" and host not in ("localhost", "127.0.0.1") and not ALLOW_LOCALHOST:
+        u = "https://" + u[7:]                                  # servers on Render are https; never talk to them in clear text
+    return (pr.scheme.lower() + "://" + pr.netloc.lower()) if not pr.path.strip("/") else u.split("?")[0].rstrip("/")
+
+
+def detect_server(url, timeout=55):
+    """Ask the URL who it is. -> {ok, server: 's1'.., title, caps} or {ok: False, error}. Waits up to ~55 s (free Render servers sleep)."""
+    url = clean_url(url)
+    if not url:
+        return {"ok": False, "error": "Ye valid URL nahi hai (jaise https://ff-s1.onrender.com)"}
+    try:
+        r = requests.get(url + "/health", headers={"X-Internal-Key": INTERNAL_KEY}, timeout=timeout)
+    except requests.exceptions.ConnectTimeout:
+        return {"ok": False, "url": url, "error": "Server ne jawab nahi diya (free Render par sleep ho sakta hai) - 1 minute baad dobara try karo"}
+    except Exception as e:
+        return {"ok": False, "url": url, "error": "Server tak pahunch nahi paya: " + str(e)[:90]}
+    try:
+        j = r.json()
+    except Exception:
+        return {"ok": False, "url": url, "error": f"HTTP {r.status_code} - ye FF server nahi lagta (health JSON nahi mila)"}
+    if not j.get("server"):
+        return {"ok": False, "url": url, "error": "Server chal raha hai par INTERNAL_KEY match nahi kar raha - dono jagah same INTERNAL_KEY daalo"}
+    return {"ok": True, "url": url, "server": str(j["server"]).lower(), "title": j.get("title") or "", "caps": j.get("caps") or [], "maintenance": bool(j.get("maintenance"))}
+
+
+def set_server_url(sid, url, who=""):
+    if sid not in URLS:
+        return False, "unknown server"
+    u = clean_url(url)
+    if not u:
+        return False, "Ye valid URL nahi hai"
+    old = URLS[sid]
+    URLS[sid], URL_BOT[sid] = u, True
+    S[sid].update({"up": None, "fails": 0, "error": ""})
+    log_event("server", f"{sid.upper()} URL {'changed' if old else 'added'}: {u.replace('https://', '')}", who)
+    _save()
+    threading.Thread(target=check, args=(sid,), daemon=True).start()
+    return True, None
+
+
+def clear_server_url(sid, who=""):
+    if sid not in URLS or not URLS[sid]:
+        return False
+    URLS[sid], URL_BOT[sid] = "", False
+    S[sid].update({"up": None, "fails": 0, "error": "", "latency": None})
+    log_event("server", f"{sid.upper()} URL removed", who)
+    _save()
+    return True
+
+
+def apply_settings(d, who=""):
+    """Whole-app switches (used by the admin panel; the Telegram bot edits the same SETTINGS). -> list of changes."""
+    ch = []
+    for k, lab in (("appMaintenance", "maintenance"), ("readOnly", "read-only"), ("alerts", "alerts"), ("domainCheck", "domain check")):
+        if k in d and bool(d[k]) != bool(SETTINGS.get(k)):
+            SETTINGS[k] = bool(d[k])
+            ch.append(f"{lab} {'ON' if SETTINGS[k] else 'OFF'}")
+    if isinstance(d.get("maintMsg"), str):
+        SETTINGS["maintMsg"] = d["maintMsg"][:300]
+    if d.get("rateLimit") not in (None, ""):
+        try:
+            v = int(d["rateLimit"])
+            if 20 <= v <= 100000 and v != SETTINGS["rateLimit"]:
+                SETTINGS["rateLimit"] = v
+                ch.append(f"rate limit {v}/min")
+        except Exception:
+            pass
+    if isinstance(d.get("features"), dict):
+        for k, v in d["features"].items():
+            if k in FEATURES:
+                if bool(v):
+                    if SETTINGS["features"].pop(k, None) is False:
+                        ch.append(f"{k} ON")
+                elif SETTINGS["features"].get(k) is not False:
+                    SETTINGS["features"][k] = False
+                    ch.append(f"{k} OFF")
+    if isinstance(d.get("featureMsg"), dict):
+        for k, v in d["featureMsg"].items():
+            if k in FEATURES:
+                if str(v).strip():
+                    SETTINGS["featureMsg"][k] = str(v)[:300]
+                else:
+                    SETTINGS["featureMsg"].pop(k, None)
+    if ch:
+        log_event("control", "admin panel: " + ", ".join(ch), who)
+    _save()
+    return ch
+
+
+def overview():
+    with LOCK:
+        servers = {i: {"url": URLS[i], "urlSource": "app" if URL_BOT[i] else ("env" if URLS[i] else ""), "mode": S[i]["mode"], "up": S[i]["up"], "available": available(i),
+                       "fails": S[i]["fails"], "latencyMs": S[i]["latency"], "lastCheck": S[i]["last"], "error": S[i]["error"], "caps": S[i]["info"].get("caps"),
+                       "title": S[i]["info"].get("title"), "maintenance": S[i]["info"].get("maintenance"), "uptime": S[i]["info"].get("uptime"), "db": S[i]["info"].get("db"),
+                       "traffic": dict(SRV[i])} for i in IDS}
+    import tgbot
+    return {"servers": servers, "routes": route_table(), "stateStore": bool(state_store()), "stateStoreFromEnv": bool(STATE_STORE_ENV or (URLS["s4"] and not URL_BOT["s4"])),
+            "settings": {k: SETTINGS[k] for k in ("domainCheck", "appMaintenance", "maintMsg", "readOnly", "rateLimit", "alerts", "ipBlock")},
+            "features": [{"key": k, "label": v[0], "off": SETTINGS["features"].get(k) is False, "message": SETTINGS["featureMsg"].get(k, ""), "default": v[2]} for k, v in FEATURES.items()],
+            "stats": dict(STATS, uptime=int(time.time()) - STATS["since"]), "events": list(EVENTS)[:40],
+            "domains": [{"id": d["id"], "host": d["host"], "active": d.get("active", True), "addedAt": d.get("addedAt")} for d in DOMAINS.values()],
+            "rejected": sorted(BLOCKED.values(), key=lambda x: x["last"], reverse=True)[:10], "noisy": sorted(NOISY.items(), key=lambda kv: -kv[1])[:8],
+            "bot": {"configured": bool(tgbot.TOKEN), "admins": len(tgbot.ADMINS), "mode": tgbot.MODE},
+            "render": {i: bool(env("RENDER_API_KEY") and env(i.upper() + "_RENDER_ID")) for i in IDS}}
+
+
 # ------------------------------------------------------------------ routes
 def route_table():
     out = {}
@@ -438,6 +567,87 @@ def admin_set(sid):
     _save()
     threading.Thread(target=check, args=(sid,), daemon=True).start()
     return cors(jsonify(ok=True, server=sid, **out))
+
+
+@app.get("/lb/admin/overview")
+def admin_overview():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    return cors(jsonify(ok=True, **overview()))
+
+
+@app.post("/lb/admin/settings")
+def admin_settings():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    ch = apply_settings(request.get_json(silent=True) or {}, "admin panel")
+    return cors(jsonify(ok=True, changed=ch))
+
+
+@app.post("/lb/admin/ip")
+def admin_ip():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    d = request.get_json(silent=True) or {}
+    import ipaddress
+    try:
+        ip = str(ipaddress.ip_address(str(d.get("ip", "")).strip()))
+    except Exception:
+        return jerr("Not a valid IP", 400), 400
+    if d.get("action") == "unblock":
+        if ip in SETTINGS["ipBlock"]:
+            SETTINGS["ipBlock"].remove(ip)
+    elif ip not in SETTINGS["ipBlock"] and len(SETTINGS["ipBlock"]) < 500:
+        SETTINGS["ipBlock"].append(ip)
+    log_event("ip", f"{'UNBLOCK' if d.get('action') == 'unblock' else 'BLOCK'} IP {ip}", "admin panel")
+    _save()
+    return cors(jsonify(ok=True, ipBlock=SETTINGS["ipBlock"]))
+
+
+@app.post("/lb/admin/detect")
+def admin_detect():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    return cors(jsonify(detect_server((request.get_json(silent=True) or {}).get("url"), 20)))
+
+
+@app.post("/lb/admin/server-url")
+def admin_server_url():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    d = request.get_json(silent=True) or {}
+    sid = str(d.get("sid") or "").lower()
+    if d.get("clear"):
+        return cors(jsonify(ok=clear_server_url(sid, "admin panel")))
+    if not sid:                                             # no server chosen: detect which server this URL is
+        det = detect_server(d.get("url"), 20)
+        if not det.get("ok"):
+            return jerr(det["error"], 400), 400
+        sid = det["server"]
+    okk, er = set_server_url(sid, d.get("url"), "admin panel")
+    return (cors(jsonify(ok=True, sid=sid)) if okk else (jerr(er, 400), 400))
+
+
+@app.post("/lb/admin/domains")
+def admin_domains():
+    if not _admin_ok():
+        return jerr("forbidden", 403), 403
+    d = request.get_json(silent=True) or {}
+    host = norm_host(d.get("host") or "")
+    act = d.get("action")
+    if act == "add":
+        if not host:
+            return jerr("Not a valid domain", 400), 400
+        add_domain(host)
+        log_event("domain", f"domain added: {host}", "admin panel")
+    elif act in ("remove", "toggle") and host in DOMAINS:
+        if act == "remove":
+            DOMAINS.pop(host)
+        else:
+            DOMAINS[host]["active"] = not DOMAINS[host].get("active", True)
+        log_event("domain", f"domain {act}: {host}", "admin panel")
+        _save()
+    return cors(jsonify(ok=True))
 
 
 @app.post("/lb/admin/check")

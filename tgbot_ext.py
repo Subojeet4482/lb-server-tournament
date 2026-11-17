@@ -12,7 +12,9 @@
 Callback data of this module always starts with "x:" (Telegram limit: 64 bytes).
 """
 import ipaddress
+import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 import requests
@@ -333,7 +335,7 @@ def render_call(i, action):
 
 
 def server_extra_rows(i):
-    rows = [[B("ℹ️ Details & traffic", f"x:sd:{i}")]]
+    rows = [[B("🔗 Change URL" if L.URLS[i] else "🔗 Set URL", f"x:su:{i}"), B("ℹ️ Details & traffic", f"x:sd:{i}")]]
     if render_on(i):
         rows.append([B("⏻ Suspend (real OFF)", f"x:rd:{i}:suspend"), B("▶️ Resume", f"x:rd:{i}:resume")])
         rows.append([B("♻️ Restart", f"x:rd:{i}:restart"), B("🚀 Deploy latest", f"x:rd:{i}:deploy")])
@@ -375,6 +377,75 @@ def bulk_maint(on):
             done.append(i.upper())
     log("server", f"maintenance {'ON' if on else 'OFF'} for {', '.join(done) or 'none'}")
     return done
+
+
+# ------------------------------------------------------------------ 🔗 SERVER URLS (add / change from Telegram)
+URL_RX = re.compile(r"https?://[^\s<>\"']+|[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(?::\d+)?(?:/[^\s]*)?")
+
+
+def role_name(sid):
+    return f"{sid.upper()} {T.NAMES.get(sid, '')}".strip()
+
+
+def s4_note(sid):
+    if sid == "s4" and not (L.STATE_STORE_ENV or not L.URL_BOT["s4"]):
+        return ("\n\n⚠️ <b>Zaroori:</b> S4 ka URL Render env mai bhi daalo (<code>S4_URL</code>). Saved settings S4 mai rehti hain, to restart ke baad LB ko S4 ka URL "
+                "pehle se pata hona chahiye.")
+    return ""
+
+
+def add_urls(chat, text):
+    """Paste one or many server URLs -> each one is asked 'who are you?' (health check) and saved to the right server automatically."""
+    urls = []
+    for m in URL_RX.findall(text or ""):
+        u = L.clean_url(m)
+        if u and u not in urls:
+            urls.append(u)
+    if not urls:
+        return "❌ Koi URL nahi mila. Jaise bhejo: <code>https://ff-s1.onrender.com</code>", [[B("➕ Dobara", "x:sadd"), B("⬅️ Servers", "s:list")]]
+    urls = urls[:8]
+    with ThreadPoolExecutor(len(urls)) as ex:
+        dets = list(ex.map(L.detect_server, urls))
+    lines, notes = ["🔗 <b>Server URLs</b>\n"], ""
+    for u, d in zip(urls, dets):
+        host = u.replace("https://", "").replace("http://", "")
+        if not d.get("ok"):
+            lines.append(f"❌ <code>{esc(host)}</code>\n    {esc(d.get('error'))}")
+            continue
+        sid = d["server"]
+        if sid not in L.URLS:
+            lines.append(f"❌ <code>{esc(host)}</code>\n    Ye server id <code>{esc(sid)}</code> hamare system ka nahi hai")
+            continue
+        old = L.URLS[sid]
+        okk, er = L.set_server_url(sid, u, who())
+        if okk:
+            lines.append(f"✅ <b>{esc(role_name(sid))}</b> ← <code>{esc(host)}</code>" + (" <i>(purana URL replace hua)</i>" if old and old != u else ""))
+            notes += s4_note(sid)
+        else:
+            lines.append(f"❌ <code>{esc(host)}</code> — {esc(er)}")
+    miss = [i.upper() for i in L.IDS if not L.URLS[i]]
+    lines.append("\n" + (f"⏳ Abhi URL baaki: <b>{', '.join(miss)}</b> — <code>/addserver url</code> se jodo." if miss else "🎉 <b>Saare 5 servers ke URL set hain.</b>") + notes)
+    return "\n".join(lines), [[B("🖥 Servers", "s:list"), B("🔄 Check now", "s:check")], [B("➕ Aur URL", "x:sadd")]]
+
+
+def set_one_url(chat, sid, text):
+    """Change the URL of ONE server. If the URL answers as a different server, ask before saving."""
+    u = L.clean_url(text)
+    if not u:
+        return "❌ Ye valid URL nahi hai.", [[B("🔗 Dobara", f"x:su:{sid}"), B("⬅️ Back", f"s:{sid}")]]
+    d = L.detect_server(u)
+    host = u.replace("https://", "")
+    if d.get("ok") and d["server"] == sid:
+        L.set_server_url(sid, u, who())
+        t, r = T.server_screen(sid)
+        return f"✅ <b>{esc(role_name(sid))}</b> ← <code>{esc(host)}</code> saved.{s4_note(sid)}\n\n" + t, r
+    PENDING[chat] = {"url": u}
+    if d.get("ok"):
+        other = d["server"]
+        return (f"⚠️ <code>{esc(host)}</code> ye <b>{esc(role_name(other))}</b> ka URL hai, {sid.upper()} ka nahi.\nKya karun?",
+                [[B(f"✅ {other.upper()} me save", f"x:ssv:{other}"), B(f"⚠️ Phir bhi {sid.upper()} me", f"x:ssv:{sid}")], [B("✖️ Cancel", f"s:{sid}")]])
+    return (f"❌ <code>{esc(host)}</code>\n{esc(d.get('error'))}\n\nAgar server abhi sleep / deploy me hai to URL phir bhi save kar sakte ho.",
+            [[B(f"💾 Phir bhi {sid.upper()} me save", f"x:ssv:{sid}")], [B("🔗 Dobara", f"x:su:{sid}"), B("⬅️ Back", f"s:{sid}")]])
 
 
 # ------------------------------------------------------------------ callbacks
@@ -536,6 +607,27 @@ def on_callback(chat, msg, p):
         done = bulk_maint(True)
         t, r = T.servers_screen()
         return show(chat, msg, f"🚧 Maintenance ON: {', '.join(done) or '—'}\n\n" + t, r)
+    if a == "sadd":
+        PENDING[chat] = {"await": "x_srv_urls"}
+        miss = [i.upper() for i in L.IDS if not L.URLS[i]]
+        return show(chat, msg, "➕ <b>Server URLs jodo</b>\n\nRender par host kiye hue servers ke URL bhejo — <b>ek ya saare ek saath</b> (har URL nayi line me).\n"
+                    "Main har URL se puchta hoon <i>\"tum kaun sa server ho?\"</i> aur khud sahi jagah save kar deta hoon (S1 / S2 / S3 / S4 / S5). Tumhe batana nahi padta.\n\n"
+                    "Jaise:\n<code>https://ff-s1.onrender.com\nhttps://ff-s2.onrender.com</code>\n\n"
+                    + (f"Abhi baaki: <b>{', '.join(miss)}</b>\n\n" if miss else "") + "/cancel", [[B("✖️ Cancel", "s:list")]])
+    if a == "su" and len(p) == 3 and p[2] in L.S:
+        PENDING[chat] = {"await": "x_srv_url", "sid": p[2]}
+        cur = L.URLS[p[2]].replace("https://", "") if L.URLS[p[2]] else "— (set nahi)"
+        return show(chat, msg, f"🔗 <b>{esc(role_name(p[2]))} — URL</b>\n\nAbhi: <code>{esc(cur)}</code>\n\nNaya URL bhejo (jaise <code>https://ff-{p[2]}.onrender.com</code>).\n/cancel",
+                    [[B("🗑 URL hata do", f"x:sud:{p[2]}")] if L.URLS[p[2]] else [], [B("✖️ Cancel", f"s:{p[2]}")]] if L.URLS[p[2]] else [[B("✖️ Cancel", f"s:{p[2]}")]])
+    if a == "sud" and len(p) == 3 and p[2] in L.S:
+        L.clear_server_url(p[2], who())
+        return show(chat, msg, f"🗑 {p[2].upper()} ka URL hata diya.\n\n" + T.servers_screen()[0], T.servers_screen()[1])
+    if a == "ssv" and len(p) == 3 and p[2] in L.S:
+        u = PENDING.pop(chat, {}).get("url")
+        if not u:
+            return show(chat, msg, *T.servers_screen())
+        L.set_server_url(p[2], u, who())
+        return show(chat, msg, f"✅ <b>{esc(role_name(p[2]))}</b> ← <code>{esc(u.replace('https://', ''))}</code> saved.{s4_note(p[2])}\n\n" + T.servers_screen()[0], T.servers_screen()[1])
     if a == "sd" and len(p) == 3 and p[2] in L.S:
         return show(chat, msg, *server_detail(p[2]))
     if a == "rd" and len(p) == 4 and p[2] in L.S and p[3] in ("suspend", "resume", "restart", "deploy") and render_on(p[2]):
@@ -558,6 +650,17 @@ def on_text(chat, t, cmd, arg):
     # ----- slash commands
     if cmd in ("/control", "/controls"):
         return show(chat, None, *controls_screen()) or True
+    if cmd == "/addserver":
+        if arg:
+            show(chat, None, "⏳ URL check ho rahe hain… (sleeping server ko jagane me ~1 min lag sakta hai)", [])
+            return show(chat, None, *add_urls(chat, arg)) or True
+        return on_callback(chat, None, ["x", "sadd"]) or True
+    if cmd == "/seturl":
+        parts = arg.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in L.S:
+            show(chat, None, "⏳ URL check ho raha hai…", [])
+            return show(chat, None, *set_one_url(chat, parts[0].lower(), parts[1])) or True
+        return show(chat, None, "Use: <code>/seturl s1 https://ff-s1.onrender.com</code>\nYa seedha <code>/addserver</code> (URL khud pehchan leta hoon).") or True
     if cmd == "/wallet":
         return show(chat, None, *wallet_screen()) or True
     if cmd in ("/referral", "/refer"):
@@ -642,6 +745,12 @@ def on_text(chat, t, cmd, arg):
     if not kind.startswith("x_"):
         return False
     PENDING.pop(chat, None)
+    if kind == "x_srv_urls":
+        show(chat, None, "⏳ URL check ho rahe hain… (sleeping server ko jagane me ~1 min lag sakta hai)", [])
+        return show(chat, None, *add_urls(chat, t)) or True
+    if kind == "x_srv_url":
+        show(chat, None, "⏳ URL check ho raha hai…", [])
+        return show(chat, None, *set_one_url(chat, aw["sid"], t)) or True
     if kind == "x_maint_msg":
         S["maintMsg"] = "" if t == "-" else t[:300]
         L._save()

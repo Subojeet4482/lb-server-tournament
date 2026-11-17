@@ -56,3 +56,18 @@ Admin HTTP API (header `X-Admin-Key`): `GET /lb/admin/servers`, `POST /lb/admin/
 How it works: Controls / Security are enforced **inside the load balancer** (instant, no server or database change, saved in the state store so they survive restarts).
 Wallet / Referral / Players use new admin endpoints on Server-1 (`/wallet/admin/switches`, `/ref/admin/config`, `/user/admin/*`), Games use the existing `/game/*/admin/config` on Server-3.
 Not included on purpose: changing a player's wallet balance from Telegram (too risky without a second confirmation + audit trail) - use the admin panel for that.
+
+## Adding your servers (easy way - no Render env editing)
+After you host S1...S5 on Render you do **not** have to paste all five URLs into the load balancer's environment.
+* In Render env of the load balancer keep only: `INTERNAL_KEY`, `LB_ADMIN_KEY`, `TG_BOT_TOKEN`, `TG_ADMIN_IDS`, **`S4_URL`** (the state store lives in Server-4) and `BOOTSTRAP_DOMAINS`.
+* Then in Telegram: `/addserver` and paste the URLs - one or all five together:
+  ```
+  https://ff-s1.onrender.com
+  https://ff-s2.onrender.com
+  ...
+  ```
+  The bot asks every URL "who are you?" (`/health`) and saves it as the right server (S1/S2/S3/S4/S5) by itself, tells you if a URL is unreachable or if its `INTERNAL_KEY` differs. `/seturl s2 <url>` changes one, 🖥 Servers -> 🔗 Change URL does the same with buttons.
+* The same is in the admin panel: **Servers & Control** tab -> "Add servers by URL" (set `LB_URL` + `LB_ADMIN_KEY` on the admin panel service).
+* URLs set this way are saved in the state store (Server-4), so they survive restarts. If you also keep `S1_URL`... in env, the saved value wins.
+
+Admin REST API (header `X-Admin-Key`, used by the admin panel): `GET /lb/admin/overview` · `POST /lb/admin/settings` · `POST /lb/admin/ip` · `POST /lb/admin/detect` · `POST /lb/admin/server-url` · `POST /lb/admin/domains` · `POST /lb/admin/servers/<s1..s5>` · `POST /lb/admin/check`.

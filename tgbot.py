@@ -146,7 +146,7 @@ def servers_screen():
     for i in L.IDS:
         s = L.S[i]
         lat = f" · {s['latency']} ms" if s["latency"] is not None and s["mode"] != "off" else ""
-        lines.append(f"{st_icon(i)} <b>{i.upper()}</b> {NAMES[i]} — {mode_label(s['mode'])}{lat}")
+        lines.append((f"{st_icon(i)} <b>{i.upper()}</b> {NAMES[i]} — {mode_label(s['mode'])}{lat}") if L.URLS[i] else f"➕ <b>{i.upper()}</b> {NAMES[i]} — <b>URL set nahi hai</b>")
     rt = L.route_table()
     lines.append("\n🔀 <b>Traffic route</b>")
     for label, g in GROUPS:
@@ -161,6 +161,8 @@ def servers_screen():
             row = []
     if row:
         rows.append(row)
+    miss = [i for i in L.IDS if not L.URLS[i]]
+    rows.append([B("➕ Server URLs jodo" + (f" ({len(miss)} baaki)" if miss else ""), "x:sadd")])
     rows.append([B("🤖 All Auto", "x:sa:auto"), B("🟢 All ON", "x:sa:on")])
     rows.append([B("🚧 Maintenance ALL ON", "x:mall:1"), B("✅ Maintenance ALL OFF", "x:mall:0")])
     rows.append([B("🔄 Check now", "s:check"), B("⬅️ Back", "m:main")])
@@ -169,6 +171,9 @@ def servers_screen():
 
 def server_screen(i):
     s = L.S[i]
+    if not L.URLS[i]:
+        return (f"➕ <b>{i.upper()} — {NAMES[i]}</b>\n\nIs server ka URL abhi set nahi hai.\nURL bhejo, main khud check karke save kar dunga.",
+                [[B("🔗 Set URL", f"x:su:{i}")], [B("⬅️ Servers", "s:list")]])
     host = L.URLS[i].replace("https://", "").replace("http://", "") or "— (URL not set)"
     txt = (f"{st_icon(i)} <b>{i.upper()} — {NAMES[i]}</b>\n\n🔗 <code>{esc(host)}</code>\n⚙️ Mode: <b>{mode_label(s['mode'])}</b>\n"
            f"📡 Health: <b>{'UP' if s['up'] else 'DOWN' if s['up'] is False else 'not checked'}</b>\n⏱ Latency: {s['latency'] if s['latency'] is not None else '-'} ms\n"
@@ -763,7 +768,7 @@ def _run_polling():
             process(u)
 
 
-COMMANDS = [{"command": "start", "description": "Open control panel"}, {"command": "servers", "description": "Server status"},
+COMMANDS = [{"command": "start", "description": "Open control panel"}, {"command": "servers", "description": "Server status"}, {"command": "addserver", "description": "Add server URLs (auto-detect)"},
             {"command": "control", "description": "Maintenance, read-only, feature switches"}, {"command": "wallet", "description": "Deposit / withdraw switches & limits"},
             {"command": "players", "description": "Find / ban / unban players"}, {"command": "security", "description": "IP block, rate limit"},
             {"command": "referral", "description": "Refer & Earn settings"}, {"command": "games", "description": "Coin Battle / Bomb switches"},
