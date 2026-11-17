@@ -6,10 +6,9 @@ TG_MODE=webhook (default)  Telegram POSTs every update to  PUBLIC_URL/tg/webhook
 TG_MODE=polling            the bot asks Telegram for updates (getUpdates). Best for a paid / always-on server. No public URL needed.
 Only ONE mode is ever active: webhook mode never calls getUpdates, polling mode deletes the webhook first and rejects webhook calls."""
 import os, re, time, html, hmac, hashlib, threading, collections, requests
-from concurrent.futures import ThreadPoolExecutor
 
 TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
-OWNERS = {int(x) for x in os.environ.get("TG_ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}      # env admins = owners
+ADMINS = {int(x) for x in os.environ.get("TG_ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
 UPDATES = ["message", "callback_query"]
 
@@ -22,7 +21,6 @@ MODE = os.environ.get("TG_MODE", "webhook").strip().lower()
 if MODE not in ("webhook", "polling"):
     log(f"WARNING: TG_MODE='{MODE}' is not valid (use webhook or polling) - falling back to webhook")
     MODE = "webhook"
-ENV_MODE = MODE                  # MODE itself can be switched at runtime from the bot (Settings -> Bot mode)
 
 # secret token that Telegram sends back in the X-Telegram-Bot-Api-Secret-Token header. If TG_WEBHOOK_SECRET is empty it is derived
 # from the bot token (stable across restarts, so you do not have to configure anything).
@@ -38,12 +36,7 @@ SEEN = collections.OrderedDict()     # update_id -> time  (duplicate protection)
 SEEN_LOCK = threading.Lock()
 SEEN_MAX = 5000
 _warn_at = {"auth": 0}
-PENDING = {}                 # chat_id -> {"await": "add_domain" | ...}
-CTX = threading.local()      # who is handling the current update (for the activity log)
-RUN = {"gen": 0, "thread": None}
-RUN_LOCK = threading.Lock()
-STATUS = {"lastPoll": 0, "pollErrors": 0, "lastError": "", "updates": 0, "since": 0}
-POOL = ThreadPoolExecutor(8)
+PENDING = {}                 # chat_id -> {"await": "add_domain"}
 VIEW = {}                    # chat_id -> {"blocked": [origins]}
 NAMES = {"s1": "Account", "s2": "History", "s3": "Chat & Game", "s4": "Backup (all-in-one)", "s5": "Fraud check"}
 GROUPS = [("Account / Balance / Match", "s1"), ("History", "s2"), ("Chat & Game", "s3"), ("Fraud check", "s5")]
@@ -73,6 +66,12 @@ def api(method, _t=20, **p):
     return r
 
 
+def notify_admins(text):
+    """Push a message to every admin (server down / up ...)."""
+    for a in ADMINS:
+        api("sendMessage", chat_id=a, text=text, parse_mode="HTML", disable_web_page_preview=True)
+
+
 def esc(x):
     return html.escape(str(x if x is not None else ""))
 
@@ -82,59 +81,13 @@ def B(text, data):
 
 
 def show(chat, msg, text, rows=None):
-    """Edit the existing message (menus feel like an app) or send a new one. Falls back to plain text if Telegram rejects the HTML."""
-    text = text if len(text) <= 4000 else text[:3990] + "…"
+    """Edit the existing message (menus feel like an app) or send a new one."""
     p = dict(chat_id=chat, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup={"inline_keyboard": rows or []})
     if msg:
         r = api("editMessageText", message_id=msg, **p)
         if r.get("ok") or "not modified" in str(r.get("description", "")):
             return
-    r = api("sendMessage", **p)
-    if not r.get("ok") and "parse" in str(r.get("description", "")).lower():
-        p.pop("parse_mode")
-        p["text"] = html.unescape(re.sub(r"<[^>]+>", "", text))
-        api("sendMessage", **p)
-
-
-def actor():
-    return f"tg:{getattr(CTX, 'uid', '?')}"
-
-
-def is_owner():
-    return getattr(CTX, "uid", 0) in OWNERS
-
-
-def admin_ids():
-    return OWNERS | {int(k) for k in (L.EXTRA_ADMINS if L else {}) if str(k).lstrip("-").isdigit()}
-
-
-def is_admin(uid):
-    return uid in admin_ids()
-
-
-def send_file(chat, name, data, caption=""):
-    """Send a file (document) to a chat. -> (ok, error)"""
-    if not TOKEN:
-        return False, "TG_BOT_TOKEN not set"
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data={"chat_id": chat, "caption": caption[:900], "parse_mode": "HTML"},
-                          files={"document": (name, data)}, timeout=120).json()
-        return bool(r.get("ok")), str(r.get("description", ""))[:150]
-    except Exception as e:
-        return False, str(e)[:120]
-
-
-def download_file(file_id, max_bytes):
-    """Download a file the admin uploaded to the bot. -> bytes | None"""
-    r = api("getFile", file_id=file_id)
-    path = (r.get("result") or {}).get("file_path")
-    if not path:
-        return None
-    try:
-        x = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=60)
-        return x.content if x.status_code == 200 and len(x.content) <= max_bytes else None
-    except Exception:
-        return None
+    api("sendMessage", **p)
 
 
 def ago(ms):
@@ -159,13 +112,33 @@ def mode_label(m):
 
 
 def main_text():
-    import tgx
-    return tgx.main_text()
+    up = sum(1 for i in L.IDS if L.available(i))
+    act = sum(1 for d in L.DOMAINS.values() if d.get("active", True))
+    chk = "🟢 ON" if L.SETTINGS["domainCheck"] else "🔴 OFF (anyone can call the API!)"
+    S_ = L.SETTINGS
+    off = [k for k, v in S_["features"].items() if v is False]
+    app = "🚧 <b>MAINTENANCE</b>" if S_["appMaintenance"] else "🟢 LIVE"
+    extra = []
+    if S_["readOnly"]:
+        extra.append("🧊 <b>Read-only mode ON</b>")
+    if off:
+        extra.append(f"⛔ Features OFF: <b>{len(off)}</b>")
+    if S_["ipBlock"]:
+        extra.append(f"🔒 Blocked IPs: {len(S_['ipBlock'])}")
+    return ("🛡 <b>FF Cash Battle — Control Panel</b>\n\n"
+            f"📱 App: {app}\n🖥 Servers online: <b>{up}/5</b>\n🌐 Verified domains: <b>{act}</b>\n🔐 Domain check: {chk}\n🔔 Alerts: {'ON' if S_['alerts'] else 'off'}"
+            + ("\n" + " · ".join(extra) if extra else "") + "\n\nNeeche se option choose karo 👇")
 
 
 def main_rows():
-    import tgx
-    return tgx.main_rows()
+    return [[B("🖥 Servers", "s:list"), B("🎛 Controls", "x:ctl")],
+            [B("👤 Players", "x:pl"), B("💰 Wallet", "x:wl")],
+            [B("🤝 Referral", "x:rf"), B("🎮 Games", "x:gp")],
+            [B("🌐 Domains", "d:list"), B("🔒 Security", "x:sc")],
+            [B("🛡 Fraud cases", "f:list"), B("🗺 State block", "g:menu")],
+            [B("💾 Backup", "bk:menu"), B("📊 Stats", "st:view")],
+            [B("📜 Activity log", "x:lg"), B("⚙️ Settings", "set:menu")],
+            [B("🔄 Refresh", "m:main")]]
 
 
 def servers_screen():
@@ -188,8 +161,9 @@ def servers_screen():
             row = []
     if row:
         rows.append(row)
-    rows.append([B("🔄 Check now", "s:check"), B("🤖 All → AUTO", "s:auto")])
-    rows.append([B("⬅️ Back", "m:main")])
+    rows.append([B("🤖 All Auto", "x:sa:auto"), B("🟢 All ON", "x:sa:on")])
+    rows.append([B("🚧 Maintenance ALL ON", "x:mall:1"), B("✅ Maintenance ALL OFF", "x:mall:0")])
+    rows.append([B("🔄 Check now", "s:check"), B("⬅️ Back", "m:main")])
     return "\n".join(lines), rows
 
 
@@ -207,15 +181,75 @@ def server_screen(i):
     rows = [[B("🤖 Auto", f"sm:{i}:auto"), B("🟢 Force ON", f"sm:{i}:on"), B("🔴 OFF", f"sm:{i}:off")],
             [B("🛠 Maintenance ON", f"sx:{i}:1"), B("✅ Maintenance OFF", f"sx:{i}:0")],
             [B("🔄 Check", f"s:chk:{i}"), B("⬅️ Servers", "s:list")]]
+    try:
+        rows = rows[:-1] + T_ext().server_extra_rows(i) + rows[-1:]
+    except Exception as e:
+        log("ext rows:", repr(e)[:80])
     return txt, rows
 
 
-def key_message(host, key, new=True):
-    return (f"{'✅ <b>Domain verified &amp; added</b>' if new else '♻️ <b>New site key generated</b>'}\n\n🌐 <code>{esc(host)}</code>\n\n"
-            f"🔑 Site key <i>(sirf ek baar dikhegi — abhi copy karo)</i>:\n<code>{esc(key)}</code>\n\n"
-            "<b>Frontend me kya karna hai</b>\nHar API request me ye header bhejo:\n"
-            f"<code>X-Site-Key: {esc(key)}</code>\n\n"
-            f"Browser <code>Origin</code> header khud bhejta hai. Sirf <code>https://{esc(host)}</code> se aayi aur sahi key wali requests accept hongi — baaki sab reject.")
+def domains_screen():
+    if not L.DOMAINS:
+        txt = ("🌐 <b>Verified domains</b>\n\nAbhi koi domain add nahi hai, isliye API par <b>saari requests reject</b> ho rahi hain.\n"
+               "➕ Add domain dabao aur apni user-panel ka domain bhejo.")
+    else:
+        lines = ["🌐 <b>Verified domains</b>\n"]
+        for n, d in enumerate(sorted(L.DOMAINS.values(), key=lambda x: x["addedAt"]), 1):
+            lines.append(f"{n}. {'✅' if d.get('active', True) else '⏸'} <code>{esc(d['host'])}</code>")
+        lines.append("\nSirf inhi domains ki requests accept hongi, baaki sab reject.")
+        txt = "\n".join(lines)
+    rows = [[B(f"{'✅' if d.get('active', True) else '⏸'} {d['host']}", f"d:{d['id']}")] for d in sorted(L.DOMAINS.values(), key=lambda x: x["addedAt"])]
+    rows.append([B("➕ Add domain", "d:add")])
+    rows.append([B("⬅️ Back", "m:main")])
+    return txt, rows
+
+
+def domain_screen(d):
+    txt = (f"🌐 <b>{esc(d['host'])}</b>\n\nStatus: <b>{'✅ Active' if d.get('active', True) else '⏸ Disabled'}</b>\n"
+           f"Verification: domain only (no key needed)\n"
+           f"Added: {ago(d['addedAt'])}")
+    rows = [[B("▶️ Enable" if not d.get("active", True) else "⏸ Disable", f"dt:{d['id']}")],
+            [B("🗑 Remove", f"dd:{d['id']}")], [B("⬅️ Domains", "d:list")]]
+    return txt, rows
+
+
+def key_message(host, key="", new=True):
+    return (f"✅ <b>Domain verified &amp; added</b>\n\n🌐 <code>{esc(host)}</code>\n\n"
+            "<b>Koi key nahi chahiye.</b> Frontend me kuch bhi header bhejna zaroori nahi.\n"
+            f"Browser <code>Origin</code> header khud bhejta hai: sirf <code>https://{esc(host)}</code> se aayi requests accept hongi, baaki sab reject.")
+
+
+def blocked_screen(chat):
+    items = sorted(L.BLOCKED.values(), key=lambda x: x["last"], reverse=True)[:8]
+    VIEW[chat] = {"blocked": [x["origin"] for x in items]}
+    if not items:
+        return "🚫 <b>Blocked requests</b>\n\n✅ Abhi tak koi unverified request reject nahi hui.", [[B("⬅️ Back", "m:main")]]
+    why = {"unknown_domain": "domain registered nahi", "bad_key": "galat site key", "missing_origin": "Origin header nahi", "disabled": "domain disabled", "insecure": "http (https chahiye)"}
+    lines = ["🚫 <b>Blocked requests</b> <i>(recent)</i>\n"]
+    for n, x in enumerate(items, 1):
+        lines.append(f"{n}. <code>{esc(x['origin'])}</code> — {x['count']}× · {why.get(x['reason'], x['reason'])}\n    last: {ago(x['last'])} · <code>{esc(x['path'])}</code> · IP {esc(x['ip'])}")
+    lines.append("\nAgar koi domain tumhara apna hai to niche se allow kar do.")
+    rows = []
+    for n, x in enumerate(items):
+        h = L.norm_host(x["origin"])
+        if h and h not in L.DOMAINS:
+            rows.append([B(f"➕ Allow {h}", f"ba:{n}")])
+    rows.append([B("🧹 Clear log", "b:clear"), B("⬅️ Back", "m:main")])
+    return "\n".join(lines), rows
+
+
+def stats_screen():
+    S_ = L.STATS
+    up = int(time.time()) - S_["since"]
+    lines = ["📊 <b>Stats</b> <i>(since last restart)</i>\n",
+             f"✅ Allowed requests: <b>{S_['allowed']}</b>", f"🚫 Blocked (domain): <b>{S_['blockedDomain']}</b> · ⛔ blocked IP: <b>{S_.get('blockedIp', 0)}</b>",
+             f"⏳ Rate limited: <b>{S_['rateLimited']}</b>", "", "<b>Traffic per server</b>"]
+    for i in L.IDS:
+        c = L.SRV[i]
+        avg = int(c["ms"] / c["req"]) if c["req"] else 0
+        lines.append(f"{st_icon(i)} <b>{i.upper()}</b> — {c['req']} req · {c['err']} err · avg {avg} ms")
+    lines.append(f"\n🕒 Load balancer uptime: {up // 3600} h {up % 3600 // 60} min")
+    return "\n".join(lines), [[B("🔄 Refresh", "st:view"), B("⬅️ Back", "m:main")]]
 
 
 def admin_call(group, method, path, js=None):
@@ -249,6 +283,38 @@ def fraud_screen():
     lines.append("\n🔓 Unban = ban hata ke whitelist · ✅ Confirm = ban final")
     rows.append([B("🔄 Refresh", "f:list"), B("⬅️ Back", "m:main")])
     return "\n".join(lines), rows
+
+
+def settings_screen():
+    on = L.SETTINGS["domainCheck"]
+    txt = (f"⚙️ <b>Settings</b>\n\n🔐 Domain verification: <b>{'🟢 ON' if on else '🔴 OFF'}</b>\n"
+           f"🤖 Bot mode: <b>{MODE.upper()}</b>\n\n"
+           "ON = sirf registered domains ki requests chalti hain.\nOFF = emergency mode, koi bhi domain API use kar sakta hai (sirf debugging ke liye).")
+    al = L.SETTINGS["alerts"]
+    txt += f"\n\n🔔 Alerts (server down / up): <b>{'🟢 ON' if al else '🔴 OFF'}</b>"
+    txt += "\n⏻ Render control (real server ON/OFF): " + ("✅ " + ", ".join(i.upper() for i in L.IDS if T_ext().render_on(i)) if any(T_ext().render_on(i) for i in L.IDS) else "not configured")
+    return txt, [[B("🔴 Turn OFF" if on else "🟢 Turn ON", "set:dc:0" if on else "set:dc:1")],
+                 [B("🔕 Alerts OFF" if al else "🔔 Alerts ON", "x:al:0" if al else "x:al:1")], [B("🔎 Bot status", "set:bot")], [B("⬅️ Back", "m:main")]]
+
+
+def bot_status_screen():
+    info = api("getWebhookInfo").get("result") or {}
+    url = (info.get("url") or "").replace(SECRET, "***") if SECRET else (info.get("url") or "")
+    lines = ["🔎 <b>Bot status</b>\n", f"Mode: <b>{MODE.upper()}</b>"]
+    if MODE == "webhook":
+        okurl = bool(info.get("url")) and info.get("url", "").endswith("/tg/webhook/" + SECRET)
+        lines += [f"Webhook: {'✅ registered' if okurl else '❌ NOT registered'}", f"URL: <code>{esc(url or '-')}</code>", f"Pending updates: {info.get('pending_update_count', '?')}"]
+        if info.get("last_error_message"):
+            lines.append(f"⚠️ Last Telegram error: <code>{esc(info['last_error_message'][:140])}</code> ({ago(int(info.get('last_error_date', 0)) * 1000)})")
+    else:
+        lines += [f"Polling: ✅ active", f"Webhook: {'⚠️ still set (will be removed)' if info.get('url') else 'none (correct)'}"]
+    lines.append(f"Admins allowed: {len(ADMINS)}")
+    return "\n".join(lines), [[B("🔄 Refresh", "set:bot"), B("⬅️ Back", "set:menu")]]
+
+
+def backup_screen():
+    return ("💾 <b>Backup</b>\n\nServer-4 sab databases ka JSON backup banata hai.\n(Render free par disk restart pe saaf hota hai — download kar lo ya DB-4 use karo.)",
+            [[B("▶️ Run backup now", "bk:run"), B("📂 List backups", "bk:list")], [B("⬅️ Back", "m:main")]])
 
 
 # ------------------------------------------------------------------ state payment block
@@ -367,136 +433,24 @@ def on_geo(chat, msg, p):
     return show(chat, msg, *geo_screen())
 
 
-# ------------------------------------------------------------------ stats / bot status
-def stats_screen():
-    S_ = L.STATS
-    up = int(time.time()) - S_["since"]
-    top = sorted(L.DOMAINS.values(), key=lambda d: -d.get("hits", 0))[:5]
-    txt = ("📊 <b>Stats</b> <i>(since last restart)</i>\n\n"
-           f"✅ Allowed requests: <b>{S_['allowed']}</b>\n🚫 Blocked (domain): <b>{S_['blockedDomain']}</b>\n🔑 Blocked (wrong site key): <b>{S_['blockedKey']}</b>\n"
-           f"❌ Rejected domains hit: <b>{S_['rejected']}</b>\n🚷 Banned IP hits: <b>{S_['banned']}</b>\n⏳ Rate limited: <b>{S_['rateLimited']}</b>\n"
-           f"🛠 Maintenance 503: <b>{S_['maintenance']}</b>\n")
-    if top and top[0].get("hits"):
-        txt += "\n🏆 <b>Top domains</b>\n" + "\n".join(f"{n}. <code>{esc(d['host'])}</code> — {d.get('hits', 0)}" for n, d in enumerate(top, 1) if d.get("hits"))
-    txt += f"\n\n🕒 Load balancer uptime: {up // 86400} d {up % 86400 // 3600} h {up % 3600 // 60} min"
-    return txt, [[B("🔄 Refresh", "st:view"), B("⬅️ Back", "m:main")]]
-
-
-def bot_status_screen():
-    info = api("getWebhookInfo").get("result") or {}
-    url = (info.get("url") or "").replace(SECRET, "***") if SECRET else (info.get("url") or "")
-    lines = ["🔎 <b>Bot status</b>\n", f"Mode: <b>{MODE.upper()}</b> ({'bot se set' if L.SETTINGS.get('tgMode') else 'env TG_MODE'})"]
-    if MODE == "webhook":
-        okurl = bool(info.get("url")) and info.get("url", "").endswith("/tg/webhook/" + SECRET)
-        lines += [f"Webhook: {'✅ registered' if okurl else '❌ NOT registered'}", f"URL: <code>{esc(url or '-')}</code>", f"Pending updates: {info.get('pending_update_count', '?')}"]
-        if info.get("last_error_message"):
-            lines.append(f"⚠️ Last Telegram error: <code>{esc(info['last_error_message'][:140])}</code> ({ago(int(info.get('last_error_date', 0)) * 1000)})")
-    else:
-        lines += [f"Polling: {'✅ active' if STATUS['lastPoll'] and time.time() - STATUS['lastPoll'] < 120 else '⚠️ no recent poll'} · last poll {ago(int(STATUS['lastPoll'] * 1000))}",
-                  f"Poll errors: {STATUS['pollErrors']}" + (f" · <code>{esc(STATUS['lastError'][:100])}</code>" if STATUS["lastError"] else ""),
-                  f"Webhook: {'⚠️ still set (will be removed)' if info.get('url') else 'none (correct)'}"]
-    lines += [f"Updates handled: {STATUS['updates']}", f"Admins allowed: {len(admin_ids())}"]
-    return "\n".join(lines), [[B("🔄 Refresh", "set:bot"), B("🤖 Change mode", "set:mode")], [B("⬅️ Back", "set:menu")]]
-
-
-# ------------------------------------------------------------------ backups (database backup of Server-4)
-def admin_raw(group, method, path):
-    """Like admin_call but returns the raw bytes (for downloading a backup file)."""
-    hdr = {"X-Internal-Key": L.INTERNAL_KEY, "X-Admin-Key": L.ADMIN_KEY}
-    last = None
-    for sid in L.candidates(group):
-        try:
-            r = L.sess.request(method, L.URLS[sid] + path, headers=hdr, timeout=120)
-            if r.status_code in (502, 503, 504):
-                last = f"{sid}: HTTP {r.status_code}"
-                continue
-            return r.status_code, r.content, sid
-        except Exception as e:
-            last = f"{sid}: {str(e)[:80]}"
-    return 0, last or b"", None
-
-
-def send_db_backup(chats, name):
-    chats = list(chats) if isinstance(chats, (list, tuple, set)) else [chats]
-    if not re.fullmatch(r"backup-[0-9-]+\.json\.gz", name or ""):
-        return False, "bad file name"
-    st, data, sid = admin_raw("s4", "GET", "/backup/download/" + name)
-    if st != 200 or not isinstance(data, bytes):
-        return False, f"download failed ({st})"
-    if len(data) > 49 * 1024 * 1024:
-        return False, f"{name} is {len(data) // 1048576} MB - over Telegram's 50 MB bot limit (download it from S4 with the admin key)"
-    res = [send_file(c, name, data, f"💾 DB backup <code>{esc(name)}</code>") for c in chats]
-    bad = next((e for ok_, e in res if not ok_), None)
-    return bad is None, (f"{name} ({len(data) // 1024} KB) bhej di" if bad is None else f"Telegram error: {bad}")
-
-
-def run_db_backup(chats):
-    st, j, sid = admin_call("s4", "POST", "/backup/run")
-    if st != 200:
-        return False, f"Backup failed: {j.get('error', st)}"
-    return send_db_backup(chats, j.get("file"))
-
-
-def run_auto_backup():
-    import tgx
-    name, data = tgx.config_file()
-    chats = sorted(admin_ids())
-    for c in chats:
-        send_file(c, name, data, "⏱ Auto config backup")
-    if L.SETTINGS.get("autoBackupDb"):
-        ok_, info = run_db_backup(chats)
-        if not ok_:
-            for c in chats:
-                api("sendMessage", chat_id=c, text=f"⚠️ Auto DB backup failed: {info}")
-    L.SETTINGS["lastBackupAt"] = L.now_ms()
-    L.audit("backup.auto", "config" + (" + db" if L.SETTINGS.get("autoBackupDb") else ""), "system")
-    L._save()
-
-
-def _backup_loop():
-    time.sleep(120)
-    while True:
-        try:
-            hrs = L.SETTINGS.get("autoBackupHours", 0)
-            if hrs and L.now_ms() - L.SETTINGS.get("lastBackupAt", 0) >= hrs * 3600 * 1000:
-                run_auto_backup()
-        except Exception as e:
-            log("auto backup failed:", repr(e))
-        time.sleep(60)
-
-
-# ------------------------------------------------------------------ new-request alert (throttled: a flood of fake origins cannot flood the admin)
-NOTIFY = {"times": [], "last": 0.0}
-NOTIFY_LOCK = threading.Lock()
-
-
-def notify_new_request(e):
-    now = time.time()
-    with NOTIFY_LOCK:
-        NOTIFY["times"] = [x for x in NOTIFY["times"] if now - x < 3600]
-        if len(NOTIFY["times"]) >= 12 or now - NOTIFY["last"] < 10:
-            return
-        NOTIFY["times"].append(now)
-        NOTIFY["last"] = now
-    txt = (f"📥 <b>New domain request</b>\n\n🌐 <code>{esc(e['host'])}</code>\n📍 IP <code>{esc(e.get('ip'))}</code> · <code>{esc(e.get('path'))}</code>\n\n"
-           "Ye domain tumhari API use karna chahta hai. Approve karein?")
-    rows = [[B("✅ Approve + key", f"rq:a:{e['id']}"), B("❌ Reject", f"rq:r:{e['id']}")], [B("🔍 Detail", f"rq:v:{e['id']}"), B("📥 All requests", "rq:l:n:0")]]
-    for chat in admin_ids():
-        api("sendMessage", chat_id=chat, text=txt, parse_mode="HTML", reply_markup={"inline_keyboard": rows})
-
-
 # ------------------------------------------------------------------ actions
 def do_mode(i, mode):
     L.S[i]["mode"] = mode
-    L.audit("server.mode", f"{i} -> {mode}", actor())
     L._save()
+    try:
+        L.log_event("server", f"{i.upper()} mode → {mode.upper()}", getattr(T_ext().TL, "uid", ""))
+    except Exception:
+        pass
     threading.Thread(target=L.check, args=(i,), daemon=True).start()
 
 
 def do_maint(i, on):
     try:
+        L.log_event("server", f"{i.upper()} maintenance {'ON' if on else 'OFF'}", getattr(T_ext().TL, "uid", ""))
+    except Exception:
+        pass
+    try:
         r = requests.post(L.URLS[i] + "/internal/maintenance", json={"on": on}, headers={"X-Internal-Key": L.INTERNAL_KEY}, timeout=15)
-        L.audit("server.maintenance", f"{i} {'ON' if on else 'OFF'}", actor())
         threading.Thread(target=L.check, args=(i,), daemon=True).start()
         return r.status_code == 200
     except Exception:
@@ -513,15 +467,22 @@ def add_domain_text(chat, text):
     if host.split(":")[0] == "localhost" and not L.ALLOW_LOCALHOST:
         return ("❌ localhost allow nahi hai. Testing ke liye LB env me <code>ALLOW_LOCALHOST=true</code> karo.", [[B("✖️ Cancel", "d:list")]])
     PENDING.pop(chat, None)
-    rec, key = L.add_domain(host, actor=actor())
+    rec, key = L.add_domain(host)
     return key_message(host, key), [[B("Open domain", f"d:{rec['id']}"), B("🌐 Domains", "d:list")]]
 
 
 # ------------------------------------------------------------------ dispatcher
+def T_ext():
+    import tgbot_ext
+    return tgbot_ext
+
+
 def on_callback(chat, msg, data):
-    import tgx
     p = data.split(":")
     k = p[0]
+    if k == "x":
+        if T_ext().on_callback(chat, msg, p) is not False:
+            return
     if k == "m":
         PENDING.pop(chat, None)
         return show(chat, msg, main_text(), main_rows())
@@ -531,13 +492,7 @@ def on_callback(chat, msg, data):
         if p[1] == "check":
             L.check_all()
             return show(chat, msg, *servers_screen())
-        if p[1] == "auto":
-            for i in L.IDS:
-                L.S[i]["mode"] = "auto"
-            L.audit("server.mode", "all -> auto", actor())
-            L._save()
-            return show(chat, msg, *servers_screen())
-        if p[1] == "chk" and len(p) > 2 and p[2] in L.S:
+        if p[1] == "chk":
             L.check(p[2])
             return show(chat, msg, *server_screen(p[2]))
         if p[1] in L.S:
@@ -550,55 +505,95 @@ def on_callback(chat, msg, data):
         okk = do_maint(p[1], p[2] == "1")
         t, r = server_screen(p[1])
         return show(chat, msg, (f"✅ Maintenance {'ON' if p[2] == '1' else 'OFF'} set\n\n" if okk else "❌ Server tak pahunch nahi paye (band ya sleep?)\n\n") + t, r)
-    if k in ("d", "dx"):
-        return tgx.on_domain(chat, msg, p)
-    if k == "rq":
-        return tgx.on_requests(chat, msg, p)
-    if k == "rj":
-        return tgx.on_rejected(chat, msg, p)
-    if k == "ip":
-        return tgx.on_ip(chat, msg, p)
-    if k == "ad":
-        return tgx.on_admins(chat, msg, p)
-    if k == "au":
-        return show(chat, msg, *tgx.audit_screen())
+    if k == "d":
+        if p[1] == "list":
+            PENDING.pop(chat, None)
+            return show(chat, msg, *domains_screen())
+        if p[1] == "add":
+            PENDING[chat] = {"await": "add_domain"}
+            return show(chat, msg, "➕ <b>Domain add karo</b>\n\nApni user-panel ka domain bhejo, jaise:\n<code>app.example.com</code>\n\n(https:// aur path mat likho)  ·  /cancel", [[B("✖️ Cancel", "d:list")]])
+        d = L.domain_by_id(p[1])
+        return show(chat, msg, *(domain_screen(d) if d else domains_screen()))
+    if k in ("dk", "dt", "dd", "ddy"):
+        d = L.domain_by_id(p[1])
+        if not d:
+            return show(chat, msg, *domains_screen())
+        if k == "dt":
+            d["active"] = not d.get("active", True)
+            L._save()
+            return show(chat, msg, *domain_screen(d))
+        if k == "dd":
+            return show(chat, msg, f"🗑 <b>{esc(d['host'])}</b> hata dein?\n\nIske baad is domain ki saari requests reject hongi.", [[B("✅ Yes, remove", f"ddy:{d['id']}"), B("✖️ No", f"d:{d['id']}")]])
+        L.DOMAINS.pop(d["host"], None)
+        L._save()
+        return show(chat, msg, f"✅ <code>{esc(d['host'])}</code> remove ho gaya.\n\n" + domains_screen()[0], domains_screen()[1])
+    if k == "b":
+        if p[1] == "clear":
+            L.BLOCKED.clear()
+        return show(chat, msg, *blocked_screen(chat))
+    if k == "ba":
+        lst = VIEW.get(chat, {}).get("blocked", [])
+        host = L.norm_host(lst[int(p[1])]) if p[1].isdigit() and int(p[1]) < len(lst) else ""
+        if not host:
+            return show(chat, msg, *blocked_screen(chat))
+        rec, key = L.add_domain(host)
+        return show(chat, msg, key_message(host, key), [[B("🚫 Blocked list", "b:list"), B("🌐 Domains", "d:list")]])
     if k == "f":
         return show(chat, msg, *fraud_screen())
     if k == "fc" and len(p) == 3:
         act = "unban" if p[2] == "u" else "confirm"
         st, j, sid = admin_call("s5", "POST", f"/fraud/cases/{p[1]}/resolve", {"action": act})
-        L.audit("fraud." + act, p[1][:8], actor())
         t, r = fraud_screen()
         return show(chat, msg, (f"✅ Case #{p[1][:8]} → <b>{act}</b>\n\n" if st == 200 else f"❌ Failed: <code>{esc(j.get('error', st))}</code>\n\n") + t, r)
     if k == "bk":
-        return tgx.on_backup(chat, msg, p)
+        if p[1] == "menu":
+            return show(chat, msg, *backup_screen())
+        if p[1] == "run":
+            show(chat, msg, "⏳ Backup chal raha hai… (kuch der lag sakti hai)", [])
+            st, j, sid = admin_call("s4", "POST", "/backup/run")
+            t, r = backup_screen()
+            return show(chat, msg, (f"✅ Backup ready: <code>{esc(j.get('file'))}</code> ({int(j.get('bytes', 0)) // 1024} KB)\n\n" if st == 200 else f"❌ Backup failed: <code>{esc(j.get('error', st))}</code>\n\n") + t, r)
+        if p[1] == "list":
+            st, j, sid = admin_call("s4", "GET", "/backup/list")
+            fl = j.get("files", []) if st == 200 else []
+            txt = "📂 <b>Backups</b>\n\n" + ("\n".join(f"• <code>{esc(f['name'])}</code> — {f['bytes'] // 1024} KB" for f in fl) if fl else "Koi backup nahi mila.")
+            return show(chat, msg, txt, [[B("⬅️ Back", "bk:menu")]])
     if k == "g":
         return on_geo(chat, msg, p)
     if k == "st":
         return show(chat, msg, *stats_screen())
     if k == "set":
-        return tgx.on_settings(chat, msg, p)
+        if p[1] == "menu":
+            return show(chat, msg, *settings_screen())
+        if p[1] == "bot":
+            return show(chat, msg, *bot_status_screen())
+        if p[1] == "dc":
+            L.SETTINGS["domainCheck"] = p[2] == "1"
+            L._save()
+            return show(chat, msg, settings_screen()[0], settings_screen()[1])
     return show(chat, msg, main_text(), main_rows())
 
 
 def on_message(chat, text):
-    import tgx
     t = (text or "").strip()
     cmd = t.split()[0].lower().split("@")[0] if t.startswith("/") else ""
     arg = t[len(t.split()[0]):].strip() if cmd else ""
-    if cmd in ("/start", "/menu"):
+    if cmd in ("/start", "/menu", "/help"):
         PENDING.pop(chat, None)
         return show(chat, None, main_text(), main_rows())
-    if cmd == "/help":
-        return show(chat, None, tgx.HELP, [[B("🏠 Menu", "m:main")]])
     if cmd == "/cancel":
         PENDING.pop(chat, None)
         return show(chat, None, "✖️ Cancel ho gaya.", [[B("🏠 Menu", "m:main")]])
-    simple = {"/servers": servers_screen, "/domains": tgx.domains_screen, "/stats": stats_screen, "/fraud": fraud_screen, "/geo": geo_screen, "/requests": tgx.requests_screen,
-              "/backup": tgx.backup_screen, "/settings": tgx.settings_screen, "/status": bot_status_screen, "/log": tgx.audit_screen, "/admins": tgx.admins_screen}
-    if cmd in simple:
-        PENDING.pop(chat, None)
-        return show(chat, None, *simple[cmd]())
+    if cmd == "/servers":
+        return show(chat, None, *servers_screen())
+    if cmd == "/domains":
+        return show(chat, None, *domains_screen())
+    if cmd == "/stats":
+        return show(chat, None, *stats_screen())
+    if cmd == "/fraud":
+        return show(chat, None, *fraud_screen())
+    if cmd == "/geo":
+        return show(chat, None, *geo_screen())
     if cmd == "/geouser":
         return show(chat, None, *geo_user_screen(arg)) if arg else on_callback(chat, None, "g:u")
     if cmd == "/adddomain":
@@ -606,51 +601,35 @@ def on_message(chat, text):
     if cmd == "/removedomain":
         h = L.norm_host(arg)
         if h in L.DOMAINS:
-            L.remove_domain(h, actor())
+            L.DOMAINS.pop(h)
+            L._save()
             return show(chat, None, f"✅ <code>{esc(h)}</code> remove ho gaya.", [[B("🌐 Domains", "d:list")]])
         return show(chat, None, "❌ Ye domain list me nahi hai.", [[B("🌐 Domains", "d:list")]])
-    if cmd == "/banip":
-        if not arg:
-            return on_callback(chat, None, "ip:add")
-        return show(chat, None, *tgx.ban_text(chat, arg))
-    if cmd == "/unbanip":
-        L.unban_ip(arg.strip(), actor())
-        return show(chat, None, *tgx.bans_screen())
-    if cmd == "/addadmin":
-        if not is_owner():
-            return show(chat, None, "⛔ Sirf owner admin add kar sakta hai.", [[B("🏠 Menu", "m:main")]])
-        ok_, er = tgx.add_admin(arg.strip(), actor())
-        t2, r2 = tgx.admins_screen()
-        return show(chat, None, ("✅ Admin added\n\n" if ok_ else f"❌ {esc(er)}\n\n") + t2, r2)
-    aw = PENDING.get(chat, {})
-    kind = aw.get("await")
-    if kind == "geo_message":
+    if T_ext().on_text(chat, t, cmd, arg):
+        return
+    aw = PENDING.get(chat, {}).get("await")
+    if aw == "geo_message":
         PENDING.pop(chat, None)
         ok_, er = geo_save({"message": t})
         return show(chat, None, *geo_screen("✅ Message saved\n\n" if ok_ else f"❌ {esc(er)}\n\n"))
-    if kind == "geo_user":
+    if aw == "geo_user":
         PENDING.pop(chat, None)
         return show(chat, None, *geo_user_screen(t))
-    if kind == "add_domain":
+    if PENDING.get(chat, {}).get("await") == "add_domain":
         return show(chat, None, *add_domain_text(chat, t))
-    if kind:
-        r = tgx.on_text(chat, aw, t)
-        if r:
-            return show(chat, None, *r)
     return show(chat, None, main_text(), main_rows())
 
 
 def handle_update(u):
     try:
-        import tgx
         if "callback_query" in u:
             q = u["callback_query"]
             uid = q["from"]["id"]
             chat, msg = q["message"]["chat"]["id"], q["message"]["message_id"]
-            if not is_admin(uid):
+            if uid not in ADMINS:
                 return api("answerCallbackQuery", callback_query_id=q["id"], text="⛔ Access denied", show_alert=True)
-            CTX.uid = uid
             api("answerCallbackQuery", callback_query_id=q["id"])
+            T_ext().TL.uid = uid
             return on_callback(chat, msg, q.get("data", ""))
         m = u.get("message")
         if not m:
@@ -658,12 +637,10 @@ def handle_update(u):
         uid, chat = m["from"]["id"], m["chat"]["id"]
         if m["chat"].get("type") != "private":
             return
-        if not is_admin(uid):
+        if uid not in ADMINS:
             return api("sendMessage", chat_id=chat, parse_mode="HTML",
-                       text=f"⛔ <b>Access denied</b>\n\nYe private control bot hai.\nTumhari Telegram ID: <code>{uid}</code>\n(Owner ko ye ID <code>TG_ADMIN_IDS</code> me add karni hogi, ya bot me 👥 Admins se.)")
-        CTX.uid = uid
-        if m.get("document"):
-            return tgx.on_document(chat, m)
+                       text=f"⛔ <b>Access denied</b>\n\nYe private control bot hai.\nTumhari Telegram ID: <code>{uid}</code>\n(Owner ko ye ID <code>TG_ADMIN_IDS</code> me add karni hogi.)")
+        T_ext().TL.uid = uid
         on_message(chat, m.get("text", ""))
     except Exception as e:
         print("[tg] update error", repr(e), flush=True)
@@ -688,7 +665,6 @@ def process(u):
     if isinstance(uid, int) and seen_before(uid):
         log(f"duplicate update {uid} ignored")
         return False
-    STATUS["updates"] += 1
     handle_update(u)
     return True
 
@@ -708,7 +684,6 @@ def handle_webhook(path_secret, header_secret, update):
     if seen_before(update["update_id"]):
         log(f"duplicate update {update['update_id']} ignored")
         return 200, "duplicate"
-    STATUS["updates"] += 1
 
     def run():
         try:
@@ -742,24 +717,17 @@ def register_webhook(force=True):
     return False
 
 
-def _run_webhook(gen):
+def _run_webhook():
     time.sleep(3)
-    if RUN["gen"] != gen:
-        return
     if api("getMe").get("ok") is not True:
         log("ERROR: Telegram rejected TG_BOT_TOKEN (getMe failed) - check the token")
     api("setMyCommands", commands=COMMANDS)
     for n in range(1, 7):                                  # right after a deploy the network / DNS may need a moment
-        if RUN["gen"] != gen:
-            return
         if register_webhook(force=True):
             break
         time.sleep(10 * n)
     while True:                                            # self-heal: someone (or an old deploy) replaced the webhook
-        for _ in range(180):
-            time.sleep(10)
-            if RUN["gen"] != gen:
-                return                                     # mode was switched: this loop is finished
+        time.sleep(1800)
         try:
             register_webhook(force=False)
         except Exception as e:
@@ -767,10 +735,8 @@ def _run_webhook(gen):
 
 
 # ------------------------------------------------------------------ polling mode
-def _run_polling(gen):
+def _run_polling():
     time.sleep(3)
-    if RUN["gen"] != gen:
-        return
     if api("getMe").get("ok") is not True:
         log("ERROR: Telegram rejected TG_BOT_TOKEN (getMe failed) - check the token")
     r = api("deleteWebhook")                               # polling and a webhook cannot be active together
@@ -778,14 +744,10 @@ def _run_polling(gen):
     api("setMyCommands", commands=COMMANDS)
     log("bot started (long polling)")
     off, started, errs = 0, time.time(), 0
-    while RUN["gen"] == gen:
+    while True:
         r = api("getUpdates", _t=70, offset=off, timeout=50, allowed_updates=UPDATES)
-        if RUN["gen"] != gen:
-            return                                         # switched to webhook meanwhile: leave the updates unconfirmed, Telegram re-sends them to the webhook
         if not r.get("ok"):
             errs += 1
-            STATUS["pollErrors"] += 1
-            STATUS["lastError"] = str(r.get("description", ""))[:150]
             if r.get("error_code") == 409:
                 log("409 conflict: another copy of this bot is polling or a webhook is set. Run ONE instance per token.")
                 time.sleep(15)
@@ -793,51 +755,31 @@ def _run_polling(gen):
                 time.sleep(min(60, 3 * errs))
             continue
         errs = 0
-        STATUS["lastPoll"] = time.time()
         for u in r.get("result", []):
             off = u["update_id"] + 1
             m = u.get("message") or {}
             if m.get("date") and m["date"] < started - 120:       # ignore messages that piled up while the service was off
                 continue
-            POOL.submit(process, u)                               # a slow action (backup) must not block the next button press
+            process(u)
 
 
-COMMANDS = [{"command": "start", "description": "Open control panel"}, {"command": "requests", "description": "Domain requests (approve / reject)"},
-            {"command": "domains", "description": "Verified domains"}, {"command": "servers", "description": "Server status"},
-            {"command": "fraud", "description": "Fraud cases"}, {"command": "stats", "description": "Stats"}, {"command": "geo", "description": "State payment block"},
-            {"command": "backup", "description": "Backup / restore"}, {"command": "settings", "description": "Settings"}, {"command": "log", "description": "Activity log"},
-            {"command": "adddomain", "description": "Add a domain"}, {"command": "banip", "description": "Ban an IP"}, {"command": "help", "description": "All commands"}]
-
-
-def apply_mode():
-    """Start (or switch to) the bot mode that is wanted now: the bot setting (Settings -> Bot mode) wins over env TG_MODE. Safe to call any time."""
-    global MODE
-    if not TOKEN or L is None:
-        return
-    with RUN_LOCK:
-        want = L.SETTINGS.get("tgMode") or ENV_MODE
-        if want not in ("webhook", "polling"):
-            want = ENV_MODE
-        th = RUN.get("thread")
-        if th and th.is_alive() and want == MODE:
-            return
-        MODE = want
-        RUN["gen"] += 1                                            # the old loop sees the new generation and stops by itself
-        STATUS["since"] = time.time()
-        log(f"mode = {MODE.upper()}")
-        RUN["thread"] = threading.Thread(target=_run_polling if MODE == "polling" else _run_webhook, args=(RUN["gen"],), daemon=True, name="tg-" + MODE)
-        RUN["thread"].start()
+COMMANDS = [{"command": "start", "description": "Open control panel"}, {"command": "servers", "description": "Server status"},
+            {"command": "control", "description": "Maintenance, read-only, feature switches"}, {"command": "wallet", "description": "Deposit / withdraw switches & limits"},
+            {"command": "players", "description": "Find / ban / unban players"}, {"command": "security", "description": "IP block, rate limit"},
+            {"command": "referral", "description": "Refer & Earn settings"}, {"command": "games", "description": "Coin Battle / Bomb switches"},
+            {"command": "log", "description": "Activity log"}, {"command": "domains", "description": "Verified domains"},
+            {"command": "fraud", "description": "Fraud cases"}, {"command": "stats", "description": "Stats"},
+            {"command": "geo", "description": "State payment block"}, {"command": "adddomain", "description": "Add a domain"}]
 
 
 def start(lb_module):
     global L
     L = lb_module
+    T_ext().init(lb_module)
     if not TOKEN:
         log("TG_BOT_TOKEN not set - Telegram bot disabled")
         return
-    if not OWNERS:
+    if not ADMINS:
         log("WARNING: TG_ADMIN_IDS is empty - nobody can use the bot")
-    L.HOOKS["notify"] = notify_new_request
-    L.HOOKS["mode"] = apply_mode
-    apply_mode()
-    threading.Thread(target=_backup_loop, daemon=True, name="tg-backup").start()
+    log(f"mode = {MODE.upper()}")
+    threading.Thread(target=_run_polling if MODE == "polling" else _run_webhook, daemon=True, name="tg-" + MODE).start()

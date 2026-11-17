@@ -4,7 +4,7 @@ User panel -> **sirf is URL ko** request karta hai. Ye request ko sahi server pe
 
 ## Domain verification (bypass-proof setup)
 1. Sirf Telegram bot me add kiye hue **active domains** ki requests accept hoti hain. Baaki sab `403 domain_not_verified`.
-2. Har domain ki ek **site key** hoti hai (`sk_...`). Frontend har request me `X-Site-Key: sk_...` bhejta hai; browser `Origin` khud bhejta hai. Origin + key dono match hone chahiye, https zaroori.
+2. **Koi site key nahi.** Domain ko bot me add karo (`/adddomain`) aur bas: browser `Origin` khud bhejta hai, sirf registered + active + `https` domain ki requests accept hoti hain, baaki sab reject.
 3. CORS sirf verified domain ko milta hai (kabhi `*` nahi).
 4. Servers (S1-S5) ke public Render URL direct hit karne par `403 use_load_balancer` — server sirf LB ki secret key sunte hain.
 5. `/internal`, `/lb`, `/tg` public se band. `/fraud`, `/backup`, `/game/ball/admin` ke liye admin key chahiye.
@@ -12,40 +12,14 @@ User panel -> **sirf is URL ko** request karta hai. Ye request ko sahi server pe
 > Limit: koi script (curl) copy kiya hua Origin + key bhej sakta hai. Isliye asli suraksha = 1 ghante ka login token + rate limit + Server-5 fraud check + server-side validation. Domain check bas browsers / dusre sites ko rokta hai.
 
 ## Telegram bot (inline buttons)
-`/start` dabao. Menu:
-* **📥 Domain requests** — jo websites tumhari API use karne aayi par approved nahi thi (top list, 10 per page: 🆕 newest / 🔥 most active / 📋 log).
-  Har ek ko **✅ Approve** (site key milti hai) / **✅ Origin only** / **❌ Reject** (hamesha ke liye silent block, dobara list me nahi aata) / **❌ Reject + ban IP** / 🚷 Ban IP. "Reject all" bhi hai. Rejected list se wapas allow kar sakte ho.
-  Naya domain aate hi **alert** milta hai (Approve/Reject buttons ke saath; max 12/ghanta, spam se bachne ke liye).
-* **🌐 Domains** — enable/disable, ♻️ new key, 🔓 key off (origin only), **expiry** (24h / 7d / 30d / never), **per-domain rate limit**, note, remove, request count.
-* **🖥 Servers** — Auto / Force ON / OFF, maintenance, health, traffic route, "All → AUTO".
-* **🛡 Fraud cases**, **🗺 State block**, **📊 Stats** (top domains, blocked / rejected / banned counters).
-* **🚷 Banned IPs** — ban (permanent ya N ghante), unban. `/banip 1.2.3.4 24`.
-* **📜 Activity log** — kisne kab kya badla (bot + web dono ka).
-* **👥 Admins** — `TG_ADMIN_IDS` = owners; owner bot se extra admin add/remove kar sakta hai (`/addadmin <id>`).
-* **💾 Backup** — DB backup chalao aur file **seedha Telegram me** lo (Render disk restart pe saaf hota hai), purane backups ki list se file lo,
-  **config export** (domains + key hashes + rejected + bans + settings ek .json) aur **config restore** (file bhejo -> Replace ya Merge). **Auto backup** har 6/12/24/72/168 ghante (Settings).
-* **⚙️ Settings** — domain check, alerts, rate limit, **maintenance mode** (+ message), auto backup, **bot mode (webhook <-> polling) runtime me switch**, bot status.
-Commands: `/help` me poori list.
+`/start` dabao: **State payment block** (state list, switches, message, user check), **Servers** (Auto / Force ON / OFF / Maintenance, health, traffic route), **Domains** (add, new site key, disable, remove), **Fraud cases** (unban / confirm), **Blocked requests** (jo domain reject hue, ek tap me allow), **Backup**, **Stats**, **Settings** (domain check on/off).
 Setup: @BotFather se token, @userinfobot se apni ID -> `TG_BOT_TOKEN`, `TG_ADMIN_IDS`. Pehla domain: bot me `/adddomain app.example.com`.
-
-## Web control panel
-`https://<tumhara-lb>/lb/ui` — login = `LB_ADMIN_KEY` (key sirf browser tab me rehti hai). Bot ke saare kaam: requests approve/reject, domains, servers, IP bans, backup/restore (config download/upload, DB backup download), activity log, settings.
-10 galat key -> us IP par 10 min lock. Page strict CSP ke saath, data kabhi HTML ki tarah insert nahi hota.
-JSON API: `/lb/admin/*` (header `X-Admin-Key`).
-
-## Notes
-* State (domains, rejected, bans, admins, settings, log) Server-4 (`STATE_STORE_URL`) me save hoti hai. Agar LB restart ke time Server-4 so raha ho, to jab tak wo padhi nahi jati tab tak LB usse **overwrite nahi karta** — baad me merge karke save karta hai.
-* Per-domain request counters restart par 0 nahi hote jab tak state save ho (save har change par hota hai); global Stats restart par reset hoti hain.
-* `BOOTSTRAP_DOMAINS` wale domain restart par wapas add ho jate hain — unhe hamesha ke liye hatana ho to env se bhi hatao.
-* Tests: `pip install pytest && python -m pytest tests -q`.
 
 ### Bot mode (`TG_MODE`)
 | | `webhook` (free Render) | `polling` (paid / VPS) |
 |---|---|---|
 | Kaise | Telegram message `PUBLIC_URL/tg/webhook/<secret>` par bhejta hai | Bot Telegram se `getUpdates` mangta hai |
 | Free hours | LB soya ho to message se jaag jata hai (pehla button 30-60 sec) | LB hamesha jaga rehta hai (keep-alive ON) |
-
-Mode **bot ke andar se bhi** badal sakte ho: Settings -> Bot mode (restart nahi chahiye, env `TG_MODE` default rehta hai).
 | Env | `PUBLIC_URL` (https). Secret apne-aap (ya `TG_WEBHOOK_SECRET`) | kuch extra nahi |
 * Webhook mode: har start par webhook **apne-aap register** hota hai, har 30 min check hota hai (kisi ne badla to wapas set), header me secret token verify hota hai, same `update_id` dobara process nahi hota.
 * Dono mode kabhi ek saath active nahi: webhook me `getUpdates` nahi chalta; polling me pehle `deleteWebhook` hota hai aur `/tg/webhook` 404 deta hai.
@@ -62,3 +36,23 @@ Mode **bot ke andar se bhi** badal sakte ho: Settings -> Bot mode (restart nahi 
 
 Health check har `HEALTH_INTERVAL` sec. Server down -> traffic apne-aap Server-4 par, wapas aane par wapas.
 Admin HTTP API (header `X-Admin-Key`): `GET /lb/admin/servers`, `POST /lb/admin/servers/s1 {"mode":"auto|on|off"}`, `POST /lb/admin/check`.
+
+## Telegram bot - all controls (v3)
+`/start` opens the panel. Everything is also available as a command.
+
+| Menu | What you can do | Command |
+|---|---|---|
+| 🖥 Servers | Auto / Force ON / OFF per server, **all servers at once**, maintenance per server / all, details + traffic per server, **Suspend / Resume / Restart / Deploy through Render** (needs `RENDER_API_KEY` + `S?_RENDER_ID`) | `/servers` |
+| 🎛 Controls | **App maintenance** (whole app closed, custom message, players see a "We'll be right back" screen that re-opens by itself), **Read-only mode** (freeze every deposit / withdraw / join / game), **feature switches**: Deposit, Withdraw, Gift codes, Join matches, Games, Chat, Refer & Earn, Payment proofs, Leaderboard, Login. Custom message per feature | `/control` `/maint on <msg>` `/readonly on` `/feature withdraw off` |
+| 💰 Wallet | Deposit / Withdraw / UPI / Gift card ON-OFF + notes, min deposit, min withdraw, UPI fee (same fields as the admin panel) | `/wallet` |
+| 🤝 Referral | Refer & Earn ON/OFF, deposit needed, referrals per card, prize (fixed / random, min, max), credit to, window, limits | `/referral` |
+| 🎮 Games | Coin Battle / Bomb & Gems ON-OFF, bots ON-OFF, live games | `/games` |
+| 👤 Players | Find by Player ID / phone / e-mail / UID, balances, **ban (1 / 3 / 7 / 30 days or permanent) / unban** | `/find 1234567` `/ban 1234567 7` `/unban 1234567` |
+| 🔒 Security | **Block / unblock IPs**, rate limit per IP, most rate-limited IPs (one tap to block), domain check, rejected domains | `/security` `/blockip 1.2.3.4` `/unblockip 1.2.3.4` `/ratelimit 300` |
+| 📜 Activity log | Every server down / up and every admin action with the Telegram id of who did it | `/log` |
+| 🔔 Alerts | Telegram message to all admins when a server goes DOWN or comes back UP, maintenance changes (Settings -> Alerts ON/OFF) | `/alerts on` |
+| 🛡 Fraud · 🗺 State block · 💾 Backup · 🌐 Domains · 📊 Stats | as before (Stats now also shows traffic per server) | |
+
+How it works: Controls / Security are enforced **inside the load balancer** (instant, no server or database change, saved in the state store so they survive restarts).
+Wallet / Referral / Players use new admin endpoints on Server-1 (`/wallet/admin/switches`, `/ref/admin/config`, `/user/admin/*`), Games use the existing `/game/*/admin/config` on Server-3.
+Not included on purpose: changing a player's wallet balance from Telegram (too risky without a second confirmation + audit trail) - use the admin panel for that.
